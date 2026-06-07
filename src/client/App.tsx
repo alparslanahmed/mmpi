@@ -8,7 +8,8 @@ import {
   UserRound,
   X
 } from "lucide-react";
-import { FormEvent, PointerEvent, useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import type { CSSProperties, FormEvent, PointerEvent } from "react";
 import { QUESTIONS, QUESTION_COUNT } from "../shared/questions";
 import {
   getDisplayScales,
@@ -22,6 +23,8 @@ import type { NormMode } from "../shared/scoringData";
 type Screen = "start" | "test" | "results";
 type SaveState = "idle" | "saving" | "saved" | "offline";
 type TestStatus = "active" | "completed";
+type AnswerValue = "D" | "Y";
+type DragPhase = "idle" | "dragging" | "exiting";
 
 interface ApiSession {
   id: string;
@@ -36,7 +39,17 @@ interface ClientSession extends ApiSession {
   updatedLocallyAt: string;
 }
 
+interface DragState {
+  x: number;
+  y: number;
+  phase: DragPhase;
+  exitAnswer: AnswerValue | null;
+}
+
 const STORAGE_KEY = "mmpi-active-session-v1";
+const DRAG_THRESHOLD = 92;
+const EXIT_DISTANCE = 560;
+const IDLE_DRAG: DragState = { x: 0, y: 0, phase: "idle", exitAnswer: null };
 
 function saveLocalSession(session: ClientSession): void {
   localStorage.setItem(STORAGE_KEY, JSON.stringify(session));
@@ -99,6 +112,8 @@ export function App() {
   const [error, setError] = useState<string | null>(null);
   const [normMode, setNormMode] = useState<NormMode>("general");
   const swipeStart = useRef<{ x: number; y: number } | null>(null);
+  const swipeTimer = useRef<number | null>(null);
+  const [drag, setDrag] = useState<DragState>(IDLE_DRAG);
 
   useEffect(() => {
     const local = readLocalSession();
@@ -118,10 +133,26 @@ export function App() {
       .catch(() => setSaveState("offline"));
   }, []);
 
+  useEffect(() => {
+    return () => {
+      if (swipeTimer.current !== null) {
+        window.clearTimeout(swipeTimer.current);
+      }
+    };
+  }, []);
+
   const currentQuestion = session ? QUESTIONS[session.currentIndex] : QUESTIONS[0];
   const answeredCount = session ? Object.keys(sanitizeAnswers(session.answers)).length : 0;
   const progress = session ? ((session.currentIndex + 1) / QUESTION_COUNT) * 100 : 0;
   const activeAnswer = session ? session.answers[String(currentQuestion.id)] : undefined;
+  const dragAnswer = drag.exitAnswer ?? (drag.x > 26 ? "D" : drag.x < -26 ? "Y" : null);
+  const dragProgress = Math.min(Math.abs(drag.x) / DRAG_THRESHOLD, 1);
+  const isSwipeLocked = drag.phase === "exiting";
+  const questionCardStyle = {
+    transform: `translate3d(${drag.x}px, ${drag.y}px, 0) rotate(${drag.x / 18}deg)`,
+    "--yes-opacity": dragAnswer === "D" ? dragProgress : 0,
+    "--no-opacity": dragAnswer === "Y" ? dragProgress : 0
+  } as CSSProperties;
   const result = useMemo(() => {
     if (!session || session.status !== "completed") return null;
     return session.result ?? scoreMmpi(session.answers);
@@ -212,7 +243,7 @@ export function App() {
     }
   }
 
-  function answerCurrent(answer: "D" | "Y"): void {
+  function answerCurrent(answer: AnswerValue): void {
     if (!session || session.status === "completed") return;
     const answers = { ...session.answers, [String(currentQuestion.id)]: answer };
     const isLast = session.currentIndex >= QUESTION_COUNT - 1;
@@ -237,13 +268,53 @@ export function App() {
   }
 
   function goBack(): void {
-    if (!session || session.currentIndex === 0) return;
+    if (!session || session.currentIndex === 0 || isSwipeLocked) return;
     const next = {
       ...session,
       currentIndex: session.currentIndex - 1,
       updatedLocallyAt: new Date().toISOString()
     };
     commit(next);
+  }
+
+  function returnToCurrentQuestion(): void {
+    if (!session || isSwipeLocked) return;
+    const next: ClientSession = {
+      ...session,
+      status: "active",
+      result: null,
+      currentIndex: Math.max(0, Math.min(QUESTION_COUNT - 1, session.currentIndex)),
+      updatedLocallyAt: new Date().toISOString()
+    };
+
+    setDrag(IDLE_DRAG);
+    setSession(next);
+    saveLocalSession(next);
+    setScreen("test");
+    void persistProgress(next);
+  }
+
+  function animateAnswer(answer: AnswerValue): void {
+    if (!session || session.status === "completed" || isSwipeLocked) return;
+    const direction = answer === "D" ? 1 : -1;
+    const exitY = drag.phase === "dragging" ? drag.y : 0;
+
+    setDrag({
+      x: direction * EXIT_DISTANCE,
+      y: exitY,
+      phase: "exiting",
+      exitAnswer: answer
+    });
+
+    if (swipeTimer.current !== null) {
+      window.clearTimeout(swipeTimer.current);
+    }
+
+    swipeTimer.current = window.setTimeout(() => {
+      swipeTimer.current = null;
+      setDrag(IDLE_DRAG);
+      answerCurrent(answer);
+    }, 230);
   }
 
   function resetTest(): void {
@@ -256,18 +327,50 @@ export function App() {
   }
 
   function handlePointerDown(event: PointerEvent<HTMLElement>): void {
+    if (!session || session.status === "completed" || isSwipeLocked) return;
     swipeStart.current = { x: event.clientX, y: event.clientY };
+    event.currentTarget.setPointerCapture(event.pointerId);
+    setDrag({ x: 0, y: 0, phase: "dragging", exitAnswer: null });
+  }
+
+  function handlePointerMove(event: PointerEvent<HTMLElement>): void {
+    const start = swipeStart.current;
+    if (!start || drag.phase !== "dragging") return;
+
+    const dx = event.clientX - start.x;
+    const dy = event.clientY - start.y;
+    setDrag({
+      x: dx,
+      y: Math.max(-90, Math.min(90, dy * 0.42)),
+      phase: "dragging",
+      exitAnswer: null
+    });
   }
 
   function handlePointerUp(event: PointerEvent<HTMLElement>): void {
     const start = swipeStart.current;
     swipeStart.current = null;
     if (!start) return;
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    }
 
     const dx = event.clientX - start.x;
     const dy = event.clientY - start.y;
-    if (Math.abs(dx) < 72 || Math.abs(dx) < Math.abs(dy) * 1.25) return;
-    answerCurrent(dx > 0 ? "D" : "Y");
+    if (Math.abs(dx) >= DRAG_THRESHOLD && Math.abs(dx) >= Math.abs(dy) * 1.15) {
+      animateAnswer(dx > 0 ? "D" : "Y");
+      return;
+    }
+
+    setDrag(IDLE_DRAG);
+  }
+
+  function handlePointerCancel(event: PointerEvent<HTMLElement>): void {
+    swipeStart.current = null;
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    }
+    if (!isSwipeLocked) setDrag(IDLE_DRAG);
   }
 
   return (
@@ -303,9 +406,6 @@ export function App() {
       {screen === "test" && session && (
         <section className="test-view" aria-label="Test">
           <header className="test-header">
-            <button className="icon-button" type="button" onClick={goBack} disabled={session.currentIndex === 0} title="Geri" aria-label="Geri">
-              <ChevronLeft size={22} />
-            </button>
             <div className="progress-block">
               <div className="meta-row">
                 <span>{session.name}</span>
@@ -321,30 +421,41 @@ export function App() {
             </div>
           </header>
 
-          <article
-            className="question-panel"
-            onPointerDown={handlePointerDown}
-            onPointerUp={handlePointerUp}
-          >
-            <div className="question-number">{currentQuestion.id}</div>
-            <p>{currentQuestion.text}</p>
-            <div className="answer-state">
-              {activeAnswer === "D" && <span className="answer-chip true">Doğru</span>}
-              {activeAnswer === "Y" && <span className="answer-chip false">Yanlış</span>}
-              {!activeAnswer && <span className="answer-chip empty">Boş</span>}
-            </div>
-          </article>
+          <div className="question-stack">
+            <article
+              className={`question-panel question-card-${drag.phase}`}
+              style={questionCardStyle}
+              onPointerDown={handlePointerDown}
+              onPointerMove={handlePointerMove}
+              onPointerUp={handlePointerUp}
+              onPointerCancel={handlePointerCancel}
+            >
+              <div className="swipe-badge yes" aria-hidden="true">Doğru</div>
+              <div className="swipe-badge no" aria-hidden="true">Yanlış</div>
+              <div className="question-number">{currentQuestion.id}</div>
+              <p>{currentQuestion.text}</p>
+              <div className="answer-state">
+                {activeAnswer === "D" && <span className="answer-chip true">Doğru</span>}
+                {activeAnswer === "Y" && <span className="answer-chip false">Yanlış</span>}
+                {!activeAnswer && <span className="answer-chip empty">Boş</span>}
+              </div>
+            </article>
+          </div>
 
           <nav className="answer-dock" aria-label="Cevaplar">
-            <button className="answer-button false" type="button" onClick={() => answerCurrent("Y")}>
+            <button className="answer-button false" type="button" onClick={() => animateAnswer("Y")} disabled={isSwipeLocked}>
               <X size={24} aria-hidden="true" />
               Yanlış
             </button>
-            <button className="mini-button" type="button" onClick={skipCurrent} title="Boş bırak" aria-label="Boş bırak">
+            <button className="mini-button" type="button" onClick={goBack} disabled={session.currentIndex === 0 || isSwipeLocked} title="Geri" aria-label="Geri">
+              <ChevronLeft size={21} />
+              Geri
+            </button>
+            <button className="mini-button" type="button" onClick={skipCurrent} disabled={isSwipeLocked} title="Boş bırak" aria-label="Boş bırak">
               <SkipForward size={21} />
               Boş
             </button>
-            <button className="answer-button true" type="button" onClick={() => answerCurrent("D")}>
+            <button className="answer-button true" type="button" onClick={() => animateAnswer("D")} disabled={isSwipeLocked}>
               <Check size={24} aria-hidden="true" />
               Doğru
             </button>
@@ -357,6 +468,7 @@ export function App() {
           result={result}
           normMode={normMode}
           onNormModeChange={setNormMode}
+          onBackToTest={returnToCurrentQuestion}
           onReset={resetTest}
         />
       )}
@@ -368,11 +480,13 @@ function ResultsView({
   result,
   normMode,
   onNormModeChange,
+  onBackToTest,
   onReset
 }: {
   result: ScoreResult;
   normMode: NormMode;
   onNormModeChange: (mode: NormMode) => void;
+  onBackToTest: () => void;
   onReset: () => void;
 }) {
   const rows = getDisplayScales(result, normMode);
@@ -388,6 +502,9 @@ function ResultsView({
           <p className="eyebrow">Profil</p>
           <h1>Sonuç grafiği</h1>
         </div>
+        <button className="icon-button" type="button" onClick={onBackToTest} title="Son soruya dön" aria-label="Son soruya dön">
+          <ChevronLeft size={21} />
+        </button>
         <button className="icon-button" type="button" onClick={onReset} title="Yeni test" aria-label="Yeni test">
           <RotateCcw size={21} />
         </button>

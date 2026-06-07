@@ -117,7 +117,7 @@ async function updateSession(request: Request, env: Env, id: string): Promise<Re
 
   await env.DB.prepare(
     `UPDATE test_sessions
-     SET answers_json = ?, current_index = ?, updated_at = ?
+     SET answers_json = ?, current_index = ?, status = 'active', updated_at = ?, completed_at = NULL
      WHERE id = ?`
   )
     .bind(JSON.stringify(answers), currentIndex, now, id)
