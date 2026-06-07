@@ -1,0 +1,514 @@
+import {
+  BarChart3,
+  Check,
+  ChevronLeft,
+  RotateCcw,
+  Save,
+  SkipForward,
+  UserRound,
+  X
+} from "lucide-react";
+import { FormEvent, PointerEvent, useEffect, useMemo, useRef, useState } from "react";
+import { QUESTIONS, QUESTION_COUNT } from "../shared/questions";
+import {
+  getDisplayScales,
+  sanitizeAnswers,
+  scoreMmpi,
+  type AnswerMap,
+  type ScoreResult
+} from "../shared/scoring";
+import type { NormMode } from "../shared/scoringData";
+
+type Screen = "start" | "test" | "results";
+type SaveState = "idle" | "saving" | "saved" | "offline";
+type TestStatus = "active" | "completed";
+
+interface ApiSession {
+  id: string;
+  name: string;
+  status: TestStatus;
+  currentIndex: number;
+  answers: AnswerMap;
+  result: ScoreResult | null;
+}
+
+interface ClientSession extends ApiSession {
+  updatedLocallyAt: string;
+}
+
+const STORAGE_KEY = "mmpi-active-session-v1";
+
+function saveLocalSession(session: ClientSession): void {
+  localStorage.setItem(STORAGE_KEY, JSON.stringify(session));
+}
+
+function readLocalSession(): ClientSession | null {
+  const raw = localStorage.getItem(STORAGE_KEY);
+  if (!raw) return null;
+
+  try {
+    const parsed = JSON.parse(raw) as ClientSession;
+    if (!parsed.id || !parsed.name) return null;
+    return {
+      ...parsed,
+      answers: sanitizeAnswers(parsed.answers),
+      currentIndex: Math.max(0, Math.min(QUESTION_COUNT - 1, parsed.currentIndex ?? 0)),
+      result: parsed.result ?? null,
+      status: parsed.status === "completed" ? "completed" : "active",
+      updatedLocallyAt: parsed.updatedLocallyAt ?? new Date().toISOString()
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function apiJson<T>(path: string, init?: RequestInit): Promise<T> {
+  const response = await fetch(path, {
+    ...init,
+    headers: {
+      "Content-Type": "application/json",
+      ...(init?.headers ?? {})
+    }
+  });
+
+  const body = (await response.json()) as T & { error?: string };
+  if (!response.ok) {
+    throw new Error(body.error ?? "İstek başarısız.");
+  }
+  return body;
+}
+
+function toClientSession(session: ApiSession): ClientSession {
+  return {
+    ...session,
+    answers: sanitizeAnswers(session.answers),
+    currentIndex: Math.max(0, Math.min(QUESTION_COUNT - 1, session.currentIndex)),
+    updatedLocallyAt: new Date().toISOString()
+  };
+}
+
+function completionText(answered: number): string {
+  return `${answered}/${QUESTION_COUNT}`;
+}
+
+export function App() {
+  const [screen, setScreen] = useState<Screen>("start");
+  const [name, setName] = useState("");
+  const [session, setSession] = useState<ClientSession | null>(null);
+  const [saveState, setSaveState] = useState<SaveState>("idle");
+  const [error, setError] = useState<string | null>(null);
+  const [normMode, setNormMode] = useState<NormMode>("general");
+  const swipeStart = useRef<{ x: number; y: number } | null>(null);
+
+  useEffect(() => {
+    const local = readLocalSession();
+    if (!local) return;
+
+    setSession(local);
+    setName(local.name);
+    setScreen(local.status === "completed" ? "results" : "test");
+
+    apiJson<ApiSession>(`/api/tests/${encodeURIComponent(local.id)}`)
+      .then((remote) => {
+        const next = toClientSession(remote);
+        setSession(next);
+        saveLocalSession(next);
+        setScreen(next.status === "completed" ? "results" : "test");
+      })
+      .catch(() => setSaveState("offline"));
+  }, []);
+
+  const currentQuestion = session ? QUESTIONS[session.currentIndex] : QUESTIONS[0];
+  const answeredCount = session ? Object.keys(sanitizeAnswers(session.answers)).length : 0;
+  const progress = session ? ((session.currentIndex + 1) / QUESTION_COUNT) * 100 : 0;
+  const activeAnswer = session ? session.answers[String(currentQuestion.id)] : undefined;
+  const result = useMemo(() => {
+    if (!session || session.status !== "completed") return null;
+    return session.result ?? scoreMmpi(session.answers);
+  }, [session]);
+
+  async function persistProgress(next: ClientSession): Promise<void> {
+    setSaveState("saving");
+    try {
+      const remote = await apiJson<ApiSession>(`/api/tests/${encodeURIComponent(next.id)}`, {
+        method: "PATCH",
+        body: JSON.stringify({
+          answers: next.answers,
+          currentIndex: next.currentIndex
+        })
+      });
+      const synced = toClientSession(remote);
+      setSession((current) => (current?.id === synced.id ? synced : current));
+      saveLocalSession(synced);
+      setSaveState("saved");
+    } catch {
+      setSaveState("offline");
+    }
+  }
+
+  async function complete(next: ClientSession): Promise<void> {
+    setSaveState("saving");
+    const fallback: ClientSession = {
+      ...next,
+      status: "completed",
+      result: scoreMmpi(next.answers),
+      updatedLocallyAt: new Date().toISOString()
+    };
+
+    setSession(fallback);
+    saveLocalSession(fallback);
+    setScreen("results");
+
+    try {
+      const remote = await apiJson<ApiSession>(`/api/tests/${encodeURIComponent(next.id)}/complete`, {
+        method: "POST",
+        body: JSON.stringify({
+          answers: next.answers,
+          currentIndex: next.currentIndex
+        })
+      });
+      const synced = toClientSession(remote);
+      setSession(synced);
+      saveLocalSession(synced);
+      setSaveState("saved");
+    } catch {
+      setSaveState("offline");
+    }
+  }
+
+  function commit(next: ClientSession, shouldComplete = false): void {
+    setSession(next);
+    saveLocalSession(next);
+    if (shouldComplete) {
+      void complete(next);
+      return;
+    }
+    void persistProgress(next);
+  }
+
+  async function startTest(event: FormEvent<HTMLFormElement>): Promise<void> {
+    event.preventDefault();
+    setError(null);
+    const cleanName = name.trim().replace(/\s+/g, " ");
+    if (!cleanName) {
+      setError("İsim girin.");
+      return;
+    }
+
+    setSaveState("saving");
+    try {
+      const created = await apiJson<ApiSession>("/api/tests", {
+        method: "POST",
+        body: JSON.stringify({ name: cleanName })
+      });
+      const next = toClientSession(created);
+      setSession(next);
+      saveLocalSession(next);
+      setScreen("test");
+      setSaveState("saved");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Test başlatılamadı.");
+      setSaveState("offline");
+    }
+  }
+
+  function answerCurrent(answer: "D" | "Y"): void {
+    if (!session || session.status === "completed") return;
+    const answers = { ...session.answers, [String(currentQuestion.id)]: answer };
+    const isLast = session.currentIndex >= QUESTION_COUNT - 1;
+    const next: ClientSession = {
+      ...session,
+      answers,
+      currentIndex: isLast ? session.currentIndex : session.currentIndex + 1,
+      updatedLocallyAt: new Date().toISOString()
+    };
+    commit(next, isLast);
+  }
+
+  function skipCurrent(): void {
+    if (!session || session.status === "completed") return;
+    const isLast = session.currentIndex >= QUESTION_COUNT - 1;
+    const next = {
+      ...session,
+      currentIndex: isLast ? session.currentIndex : session.currentIndex + 1,
+      updatedLocallyAt: new Date().toISOString()
+    };
+    commit(next, isLast);
+  }
+
+  function goBack(): void {
+    if (!session || session.currentIndex === 0) return;
+    const next = {
+      ...session,
+      currentIndex: session.currentIndex - 1,
+      updatedLocallyAt: new Date().toISOString()
+    };
+    commit(next);
+  }
+
+  function resetTest(): void {
+    localStorage.removeItem(STORAGE_KEY);
+    setSession(null);
+    setName("");
+    setScreen("start");
+    setSaveState("idle");
+    setError(null);
+  }
+
+  function handlePointerDown(event: PointerEvent<HTMLElement>): void {
+    swipeStart.current = { x: event.clientX, y: event.clientY };
+  }
+
+  function handlePointerUp(event: PointerEvent<HTMLElement>): void {
+    const start = swipeStart.current;
+    swipeStart.current = null;
+    if (!start) return;
+
+    const dx = event.clientX - start.x;
+    const dy = event.clientY - start.y;
+    if (Math.abs(dx) < 72 || Math.abs(dx) < Math.abs(dy) * 1.25) return;
+    answerCurrent(dx > 0 ? "D" : "Y");
+  }
+
+  return (
+    <main className="app-shell">
+      {screen === "start" && (
+        <section className="start-view" aria-labelledby="start-title">
+          <div className="brand-row">
+            <div className="brand-mark"><BarChart3 size={22} /></div>
+            <span>MMPI</span>
+          </div>
+          <h1 id="start-title">Mobil test oturumu</h1>
+          <form className="name-form" onSubmit={startTest}>
+            <label htmlFor="participant-name">İsim</label>
+            <div className="name-input-row">
+              <UserRound size={20} aria-hidden="true" />
+              <input
+                id="participant-name"
+                value={name}
+                maxLength={80}
+                autoComplete="name"
+                onChange={(event) => setName(event.target.value)}
+              />
+            </div>
+            {error && <p className="error-text">{error}</p>}
+            <button className="primary-button" type="submit" disabled={saveState === "saving"}>
+              <Check size={20} aria-hidden="true" />
+              Başlat
+            </button>
+          </form>
+        </section>
+      )}
+
+      {screen === "test" && session && (
+        <section className="test-view" aria-label="Test">
+          <header className="test-header">
+            <button className="icon-button" type="button" onClick={goBack} disabled={session.currentIndex === 0} title="Geri" aria-label="Geri">
+              <ChevronLeft size={22} />
+            </button>
+            <div className="progress-block">
+              <div className="meta-row">
+                <span>{session.name}</span>
+                <span>{completionText(answeredCount)}</span>
+              </div>
+              <div className="progress-track" aria-hidden="true">
+                <div className="progress-fill" style={{ width: `${progress}%` }} />
+              </div>
+            </div>
+            <div className={`save-pill save-${saveState}`}>
+              <Save size={15} aria-hidden="true" />
+              <span>{saveState === "saving" ? "Kaydediliyor" : saveState === "offline" ? "Yerel" : "Kayıtlı"}</span>
+            </div>
+          </header>
+
+          <article
+            className="question-panel"
+            onPointerDown={handlePointerDown}
+            onPointerUp={handlePointerUp}
+          >
+            <div className="question-number">{currentQuestion.id}</div>
+            <p>{currentQuestion.text}</p>
+            <div className="answer-state">
+              {activeAnswer === "D" && <span className="answer-chip true">Doğru</span>}
+              {activeAnswer === "Y" && <span className="answer-chip false">Yanlış</span>}
+              {!activeAnswer && <span className="answer-chip empty">Boş</span>}
+            </div>
+          </article>
+
+          <nav className="answer-dock" aria-label="Cevaplar">
+            <button className="answer-button false" type="button" onClick={() => answerCurrent("Y")}>
+              <X size={24} aria-hidden="true" />
+              Yanlış
+            </button>
+            <button className="mini-button" type="button" onClick={skipCurrent} title="Boş bırak" aria-label="Boş bırak">
+              <SkipForward size={21} />
+              Boş
+            </button>
+            <button className="answer-button true" type="button" onClick={() => answerCurrent("D")}>
+              <Check size={24} aria-hidden="true" />
+              Doğru
+            </button>
+          </nav>
+        </section>
+      )}
+
+      {screen === "results" && session && result && (
+        <ResultsView
+          result={result}
+          normMode={normMode}
+          onNormModeChange={setNormMode}
+          onReset={resetTest}
+        />
+      )}
+    </main>
+  );
+}
+
+function ResultsView({
+  result,
+  normMode,
+  onNormModeChange,
+  onReset
+}: {
+  result: ScoreResult;
+  normMode: NormMode;
+  onNormModeChange: (mode: NormMode) => void;
+  onReset: () => void;
+}) {
+  const rows = getDisplayScales(result, normMode);
+  const elevated = rows
+    .filter((row) => row.category === "clinical" && row.displayT >= 65)
+    .sort((a, b) => b.displayT - a.displayT)
+    .slice(0, 4);
+
+  return (
+    <section className="results-view" aria-label="Sonuçlar">
+      <header className="results-header">
+        <div>
+          <p className="eyebrow">Profil</p>
+          <h1>Sonuç grafiği</h1>
+        </div>
+        <button className="icon-button" type="button" onClick={onReset} title="Yeni test" aria-label="Yeni test">
+          <RotateCcw size={21} />
+        </button>
+      </header>
+
+      <div className="notice">
+        Bu çıktı klinik tanı değildir. MMPI uygulama, puanlama ve yorumlama süreci yetkin uzman değerlendirmesi gerektirir.
+      </div>
+
+      <div className="segmented" role="tablist" aria-label="Norm">
+        {(["general", "male", "female"] as const).map((mode) => (
+          <button
+            key={mode}
+            type="button"
+            className={normMode === mode ? "active" : ""}
+            onClick={() => onNormModeChange(mode)}
+          >
+            {mode === "general" ? "Genel" : mode === "male" ? "Erkek" : "Kadın"}
+          </button>
+        ))}
+      </div>
+
+      <ProfileChart rows={rows} />
+
+      <div className="summary-grid">
+        <div className="summary-tile">
+          <span>Yanıt</span>
+          <strong>{result.answeredCount}</strong>
+        </div>
+        <div className="summary-tile">
+          <span>Boş</span>
+          <strong>{result.unansweredCount}</strong>
+        </div>
+        <div className="summary-tile">
+          <span>Kod</span>
+          <strong>{result.codeType ?? "-"}</strong>
+        </div>
+      </div>
+
+      <section className="notes">
+        {result.notes.map((note) => (
+          <p key={note}>{note}</p>
+        ))}
+      </section>
+
+      {elevated.length > 0 && (
+        <section className="elevations">
+          <h2>Yükselen ölçekler</h2>
+          {elevated.map((row) => (
+            <div className="scale-line" key={row.id}>
+              <div>
+                <strong>{row.code} {row.id}</strong>
+                <span>{row.label}</span>
+              </div>
+              <b>{Math.round(row.displayT)}</b>
+            </div>
+          ))}
+        </section>
+      )}
+
+      <section className="scale-table">
+        <h2>Cetvel</h2>
+        {rows.map((row) => (
+          <details key={row.id}>
+            <summary>
+              <span>{row.code} {row.id} · {row.label}</span>
+              <b>{Math.round(row.displayT)}</b>
+            </summary>
+            <div className="scale-detail">
+              <span>Ham: {row.displayRaw}</span>
+              <span>K ekli: {row.displayCorrected}</span>
+              <p>{row.description}</p>
+            </div>
+          </details>
+        ))}
+      </section>
+    </section>
+  );
+}
+
+function ProfileChart({ rows }: { rows: ReturnType<typeof getDisplayScales> }) {
+  const width = 720;
+  const height = 340;
+  const left = 44;
+  const right = 18;
+  const top = 18;
+  const bottom = 64;
+  const chartWidth = width - left - right;
+  const chartHeight = height - top - bottom;
+  const maxT = 120;
+  const xStep = chartWidth / Math.max(1, rows.length - 1);
+  const yFor = (value: number) => top + chartHeight - (Math.max(0, Math.min(maxT, value)) / maxT) * chartHeight;
+  const points = rows.map((row, index) => ({
+    row,
+    x: left + index * xStep,
+    y: yFor(row.displayT)
+  }));
+  const path = points.map((point, index) => `${index === 0 ? "M" : "L"} ${point.x} ${point.y}`).join(" ");
+  const guides = [30, 50, 65, 70, 90, 120];
+
+  return (
+    <div className="chart-scroll" role="img" aria-label="MMPI profil grafiği">
+      <svg className="profile-chart" viewBox={`0 0 ${width} ${height}`}>
+        <rect x={left} y={yFor(70)} width={chartWidth} height={yFor(50) - yFor(70)} className="chart-band" />
+        {guides.map((guide) => (
+          <g key={guide}>
+            <line x1={left} x2={width - right} y1={yFor(guide)} y2={yFor(guide)} className={guide === 65 || guide === 70 ? "guide-line strong" : "guide-line"} />
+            <text x={12} y={yFor(guide) + 4} className="axis-label">{guide}</text>
+          </g>
+        ))}
+        <line x1={left} x2={left} y1={top} y2={height - bottom} className="axis-line" />
+        <line x1={left} x2={width - right} y1={height - bottom} y2={height - bottom} className="axis-line" />
+        <path d={path} className="chart-path" />
+        {points.map((point) => (
+          <g key={point.row.id}>
+            <circle cx={point.x} cy={point.y} r={6} className={point.row.category === "validity" ? "chart-dot validity" : "chart-dot"} />
+            <text x={point.x} y={height - 40} textAnchor="middle" className="scale-code">{point.row.id}</text>
+            <text x={point.x} y={height - 20} textAnchor="middle" className="scale-score">{Math.round(point.row.displayT)}</text>
+          </g>
+        ))}
+      </svg>
+    </div>
+  );
+}
